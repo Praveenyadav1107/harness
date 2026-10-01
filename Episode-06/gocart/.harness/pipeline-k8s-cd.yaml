@@ -1,0 +1,224 @@
+# ============================================
+# PIPELINE: Episode 6, Topic 2 — Deploy GoCart to EKS
+# ============================================
+# Stage 1: Build & Push to ECR (CI stage, Harness Cloud)
+# Stage 2: Deploy to EKS (CD Deployment stage, K8s Delegate)
+# Stage 3: Approval
+# Stage 4: Cleanup
+#
+# ============================================
+# CHANGE THESE VALUES:
+# ============================================
+#   projectIdentifier: HarnessCICDZerotoHero  ← Your project ID
+#   orgIdentifier: default                    ← Your org name
+#   connectorRef: account.Github              ← Your GitHub connector
+#   repoName: Harness-CI-CD-Zero-to-Hero      ← Your repo name
+#   connectorRef: account.aws_account         ← Your AWS OIDC connector
+#   serviceRef: gocart                        ← Your service ID (create in CD → Services)
+#   environmentRef: development               ← Your environment ID (create in CD → Environments)
+#   infrastructureDefinitions: ekscluster    ← Your infra ID (create inside environment)
+#
+# ============================================
+# PREREQUISITES:
+# ============================================
+#   1. account.Github connector - Episode 1
+#   2. account.aws_account OIDC connector - Episode 3
+#   3. Secret: aws_access_key_id - Episode 3
+#   4. Secret: aws_secret_access_key - Episode 3
+#   5. Variable: aws_account_id - Episode 4
+#   6. Variable: aws_region - Episode 3
+#   7. EKS cluster (GitHub Actions infra.yml)
+#   8. Kubernetes Delegate installed on EKS
+#   9. Service: gocart (create in Harness CD → Services → Kubernetes type → Manifests from Git + ECR artifact)
+#  10. Environment: development (reuse from Topic 1)
+#  11. Infrastructure: eks_cluster (create inside environment → Kubernetes → Inherit from Delegate)
+# ============================================
+pipeline:
+  name: episode6-gocart-k8s-cd
+  identifier: episode6_gocart_k8s_cd
+  # CHANGE THIS: Your project ID (find in URL after /projects/)
+  projectIdentifier: HarnessCICDZerotoHero
+  # CHANGE THIS: Your org name
+  orgIdentifier: default
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        # CHANGE THIS: Your GitHub connector
+        connectorRef: account.Github
+        # CHANGE THIS: Your repo name
+        repoName: Harness-CI-CD-Zero-to-Hero
+        build: <+input>
+  stages:
+    # ============================================
+    # STAGE 1: Build & Push to ECR (CI stage)
+    # ============================================
+    - stage:
+        name: build-and-push
+        identifier: build_and_push
+        description: "Build GoCart Docker image and push to ECR"
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Install Dependencies
+                  identifier: install_deps
+                  spec:
+                    shell: Sh
+                    command: |-
+                      cd Episode-06/gocart
+                      npm install
+
+              - step:
+                  type: Run
+                  name: Build Verification
+                  identifier: build_verify
+                  spec:
+                    shell: Sh
+                    command: |-
+                      cd Episode-06/gocart
+                      npm run build
+
+              - step:
+                  type: Run
+                  name: Create ECR Repo
+                  identifier: create_ecr
+                  spec:
+                    shell: Sh
+                    image: amazon/aws-cli:latest
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+variable.aws_region>
+                    command: |-
+                      aws ecr create-repository --repository-name gocart --region <+variable.aws_region> 2>/dev/null || echo "Repository already exists"
+
+              - step:
+                  type: BuildAndPushECR
+                  name: Build and Push to ECR
+                  identifier: build_push_ecr
+                  spec:
+                    # CHANGE THIS: Your AWS OIDC connector
+                    connectorRef: account.aws_account
+                    region: <+variable.aws_region>
+                    account: <+variable.aws_account_id>
+                    imageName: gocart
+                    tags:
+                      - v<+pipeline.sequenceId>
+                      - latest
+                    dockerfile: Episode-06/gocart/Dockerfile
+                    context: Episode-06/gocart
+
+    # ============================================
+    # STAGE 2: Deploy to EKS (CD Deployment stage)
+    # ============================================
+    - stage:
+        name: deploy-to-kubernetes
+        identifier: deploy_to_kubernetes
+        description: "Rolling deployment to EKS cluster"
+        type: Deployment
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        spec:
+          deploymentType: Kubernetes
+          service:
+            # CHANGE THIS: Your service ID (create in CD → Services → Kubernetes type)
+            serviceRef: gocart
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      # CHANGE THIS: Must match Artifact Source Identifier in Service → ecr_image
+                      primaryArtifactRef: ecr_image
+                      sources:
+                        # CHANGE THIS: Must match the Artifact Source Identifier above
+                        - identifier: ecr_image
+                          type: Ecr
+                          spec:
+                            tag: v<+pipeline.sequenceId>
+          environment:
+            # CHANGE THIS: Your environment ID (create in CD → Environments)
+            environmentRef: development
+            deployToAll: false
+            infrastructureDefinitions:
+              # CHANGE THIS: Your infrastructure ID (create inside Environment) → k8sdelegate
+              - identifier: k8sdelegate
+          execution:
+            steps:
+              - step:
+                  name: Rolling Deployment
+                  identifier: rolling_deploy
+                  type: K8sRollingDeploy
+                  timeout: 10m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+
+              - step:
+                  type: ShellScript
+                  name: Verify Deployment
+                  identifier: verify_deployment
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          kubectl get pods -n gocart
+                          kubectl get svc gocart -n gocart
+                          LB=$(kubectl get svc gocart -n gocart -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+                          echo "LoadBalancer: http://$LB"
+                    onDelegate: true
+                  timeout: 5m
+
+              - step:
+                  type: ShellScript
+                  name: Health Check
+                  identifier: health_check
+                  spec:
+                    shell: Bash
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          LB=$(kubectl get svc gocart -n gocart -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                          for i in $(seq 1 18); do
+                            HTTP_CODE=$(curl -so /dev/null -w "%{http_code}" http://$LB/ 2>/dev/null || echo "000")
+                            [ "$HTTP_CODE" = "200" ] && break
+                            sleep 10
+                          done
+                          if [ "$HTTP_CODE" = "200" ]; then
+                            echo "Health check PASSED (HTTP 200)"
+                          else
+                            echo "Health check FAILED (HTTP $HTTP_CODE)"
+                            exit 1
+                          fi
+                    onDelegate: true
+                  timeout: 5m
+
+            # ============================================
+            # ROLLBACK (auto-triggered on deploy failure)
+            # ============================================
+            rollbackSteps:
+              - step:
+                  name: Rollback
+                  identifier: rollback
+                  type: K8sRollingRollback
+                  timeout: 10m
+                  spec:
+                    pruningEnabled: false

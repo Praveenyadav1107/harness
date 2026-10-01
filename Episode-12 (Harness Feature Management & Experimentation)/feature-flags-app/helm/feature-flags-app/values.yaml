@@ -1,0 +1,45 @@
+# ============================================
+# Change values HERE → templates use them automatically
+# Harness resolves <+artifact.image> and <+secrets.getValue()> at deploy time.
+# ============================================
+
+replicaCount: 2
+
+# Harness replaces <+artifact.image> with the full ECR URL:tag at deploy time
+image: <+artifact.image>
+pullPolicy: IfNotPresent
+
+# Feature Flags Server SDK key — from the Harness built-in Secret Manager (masked, not hardcoded)
+harnessFfSdkKey: <+secrets.getValue("harness_ff_sdk_key")>
+
+service:
+  type: LoadBalancer
+  port: 80
+  targetPort: 3000
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "250m"
+
+readinessProbe:
+  path: /health
+  port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+livenessProbe:
+  path: /health
+  port: 3000
+  initialDelaySeconds: 15
+  periodSeconds: 15
+  failureThreshold: 3
+
+# Kubernetes namespace (created by helm --create-namespace)
+namespace: feature-flags

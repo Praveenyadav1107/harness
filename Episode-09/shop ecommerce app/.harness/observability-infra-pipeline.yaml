@@ -1,0 +1,236 @@
+# ============================================
+# PIPELINE 1: Observability Infrastructure (Run ONCE)
+# ============================================
+# Deploys ArgoCD App-of-Apps — ArgoCD then manages all observability.
+# After this runs, ArgoCD auto-syncs monitoring/logging/tracing from Git.
+# ============================================
+pipeline:
+  name: episode9-observability-infra
+  identifier: episode9_observability_infra
+  projectIdentifier: HarnessCICDZerotoHero # ← CHANGE: your project ID
+  orgIdentifier: default # ← CHANGE: your org
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Github # ← CHANGE: your GitHub connector
+        repoName: Harness-CI-CD-Zero-to-Hero # ← CHANGE: your repo name
+        build: <+input>
+  stages:
+    # ============================================
+    # STAGE 1: Deploy ArgoCD Applications (App-of-Apps)
+    # ============================================
+    - stage:
+        name: deploy-argocd-apps
+        identifier: deploy_argocd_apps
+        description: "Apply ArgoCD Applications — ArgoCD syncs observability from Git"
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate # ← CHANGE: your K8s connector
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+          # NOTE: KubernetesDirect needs connectorRef on every Run step (unlike Harness Cloud)
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Deploy ArgoCD Apps
+                  identifier: deploy_argocd_apps_step
+                  spec:
+                    connectorRef: dockerhub # ← CHANGE: your Docker Hub connector
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      cd /harness
+
+                      # Create StorageClass (needed by Elasticsearch + Jaeger PVCs)
+                      kubectl apply -f "Episode-09/shop ecommerce app/k8s/templates/storageclass.yaml"
+
+                      # Apply monitoring files that have {{ }} syntax (ArgoCD plugin can't handle them)
+                      kubectl create namespace monitoring 2>/dev/null || true
+                      kubectl apply -f "Episode-09/shop ecommerce app/k8s/monitoring/prometheus-rules.yaml" 2>/dev/null || true
+                      kubectl apply -f "Episode-09/shop ecommerce app/k8s/monitoring/service-monitor.yaml" 2>/dev/null || true
+
+                      # Create ArgoCD default project (Harness GitOps doesn't auto-create it)
+                      ARGOCD_PROJECT=$(kubectl get appproject -n gitops -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "default")
+                      echo "ArgoCD Project: $ARGOCD_PROJECT"
+
+                      # Always ensure default project exists (idempotent)
+                      kubectl apply -f "Episode-09/shop ecommerce app/k8s/argocd-apps/appproject-default.yaml" 2>/dev/null || true
+
+                      cp "Episode-09/shop ecommerce app/k8s/argocd-apps/"*-app.yaml /tmp/
+
+                      BRANCH="<+codebase.branch>"
+                      REPO_URL="<+codebase.repoUrl>"
+
+                      echo "=== Deploying ArgoCD Applications (App-of-Apps) ==="
+                      echo "Repo: $REPO_URL"
+                      echo "Branch: $BRANCH"
+
+                      cd /tmp
+                      # Replace project name with actual ArgoCD project
+                      sed -i "s|project: default|project: $ARGOCD_PROJECT|g" monitoring-app.yaml
+                      sed -i "s|project: default|project: $ARGOCD_PROJECT|g" logging-app.yaml
+                      sed -i "s|project: default|project: $ARGOCD_PROJECT|g" tracing-app.yaml
+
+                      sed -i "s|https://github.com/YOUR-USERNAME/Harness-CI-CD-Zero-to-Hero.git|${REPO_URL}|g" monitoring-app.yaml
+                      sed -i "s|https://github.com/YOUR-USERNAME/Harness-CI-CD-Zero-to-Hero.git|${REPO_URL}|g" logging-app.yaml
+                      sed -i "s|https://github.com/YOUR-USERNAME/Harness-CI-CD-Zero-to-Hero.git|${REPO_URL}|g" tracing-app.yaml
+
+                      sed -i "s|targetRevision: master|targetRevision: $BRANCH|g" monitoring-app.yaml
+                      sed -i "s|targetRevision: master|targetRevision: $BRANCH|g" logging-app.yaml
+                      sed -i "s|targetRevision: master|targetRevision: $BRANCH|g" tracing-app.yaml
+
+                      cat monitoring-app.yaml
+
+                      # Delete old apps if they exist (clears cached errors)
+                      kubectl delete application monitoring logging tracing -n gitops 2>/dev/null || true
+                      sleep 5
+
+                      kubectl apply -f monitoring-app.yaml
+                      kubectl apply -f logging-app.yaml
+                      kubectl apply -f tracing-app.yaml
+
+                      echo "=== ArgoCD Apps Created — will auto-sync ==="
+
+              - step:
+                  type: Run
+                  name: Wait for Sync
+                  identifier: wait_for_sync
+                  spec:
+                    connectorRef: dockerhub # ← CHANGE: your Docker Hub connector
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      echo "=== Waiting for ArgoCD to sync (3-5 min) ==="
+                      kubectl wait --for=condition=ready pod -l app=grafana -n monitoring --timeout=300s 2>/dev/null || echo "Grafana still syncing..."
+                      kubectl wait --for=condition=ready pod -l app=elasticsearch -n logging --timeout=300s 2>/dev/null || echo "ES still syncing..."
+                      kubectl wait --for=condition=ready pod -l app=jaeger -n tracing --timeout=300s 2>/dev/null || echo "Jaeger still syncing..."
+                      echo "=== Sync Complete ==="
+
+              - step:
+                  type: Run
+                  name: Get All URLs
+                  identifier: get_all_urls
+                  spec:
+                    connectorRef: dockerhub # ← CHANGE: your Docker Hub connector
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      sleep 30
+                      GRAFANA=$(kubectl get svc grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+                      KIBANA=$(kubectl get svc kibana -n logging -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+                      JAEGER=$(kubectl get svc jaeger-query -n tracing -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+
+                      echo "=============================================="
+                      echo "  OBSERVABILITY STACK READY (ArgoCD managed)"
+                      echo "=============================================="
+                      echo ""
+                      echo "  1. GRAFANA:  http://$GRAFANA"
+                      echo "     Login:    admin / admin123"
+                      echo ""
+                      echo "  2. KIBANA:   http://$KIBANA"
+                      echo "     Login:    elastic / HarnessEFK@2026"
+                      echo ""
+                      echo "  3. JAEGER:   http://$JAEGER"
+                      echo "=============================================="
+
+    # ============================================
+    # STAGE 2: Verify All Observability Resources
+    # Checks ArgoCD apps, pods, and services across all namespaces
+    # ============================================
+    - stage:
+        name: verify-observability
+        identifier: verify_observability
+        description: "Verify all monitoring, logging, and tracing resources are running"
+        type: CI
+        spec:
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              # Step 1: Check ArgoCD applications status
+              - step:
+                  type: Run
+                  name: Check ArgoCD Apps
+                  identifier: check_argocd_apps
+                  spec:
+                    connectorRef: dockerhub
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      echo "=== ArgoCD Applications ==="
+                      kubectl get applications -n gitops
+
+              # Step 2: Check all pods in monitoring, logging, tracing
+              - step:
+                  type: Run
+                  name: Check All Pods
+                  identifier: check_all_pods
+                  spec:
+                    connectorRef: dockerhub
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      echo "=== Monitoring Pods ==="
+                      kubectl get pods -n monitoring
+                      echo ""
+                      echo "=== Logging Pods ==="
+                      kubectl get pods -n logging
+                      echo ""
+                      echo "=== Tracing Pods ==="
+                      kubectl get pods -n tracing
+
+              # Step 3: Check all services (LoadBalancer URLs)
+              - step:
+                  type: Run
+                  name: Check All Services
+                  identifier: check_all_services
+                  spec:
+                    connectorRef: dockerhub
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      echo "=== Monitoring Services ==="
+                      kubectl get svc -n monitoring
+                      echo ""
+                      echo "=== Logging Services ==="
+                      kubectl get svc -n logging
+                      echo ""
+                      echo "=== Tracing Services ==="
+                      kubectl get svc -n tracing
+                      echo ""
+                      echo "=== LoadBalancer URLs ==="
+                      kubectl get svc grafana -n monitoring
+                      kubectl get svc kibana -n logging
+                      kubectl get svc jaeger-query -n tracing
+
+              # Step 4: Health check — verify all critical pods are ready
+              - step:
+                  type: Run
+                  name: Health Check
+                  identifier: health_check
+                  spec:
+                    connectorRef: dockerhub
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    command: |-
+                      echo "=== Health Check: Waiting for all pods to be ready ==="
+                      kubectl wait --for=condition=ready pod -l app=grafana -n monitoring --timeout=120s && echo "Grafana: HEALTHY" || echo "Grafana: STILL STARTING"
+                      kubectl wait --for=condition=ready pod -l app=prometheus -n monitoring --timeout=120s && echo "Prometheus: HEALTHY" || echo "Prometheus: STILL STARTING"
+                      kubectl wait --for=condition=ready pod -l app=elasticsearch -n logging --timeout=300s && echo "Elasticsearch: HEALTHY" || echo "Elasticsearch: STILL STARTING (takes 3-5 min)"
+                      kubectl wait --for=condition=ready pod -l app=kibana -n logging --timeout=120s && echo "Kibana: HEALTHY" || echo "Kibana: STILL STARTING"
+                      kubectl wait --for=condition=ready pod -l app=jaeger -n tracing --timeout=120s && echo "Jaeger: HEALTHY" || echo "Jaeger: STILL STARTING"
+                      echo ""
+                      echo "=== HEALTH CHECK COMPLETE ==="

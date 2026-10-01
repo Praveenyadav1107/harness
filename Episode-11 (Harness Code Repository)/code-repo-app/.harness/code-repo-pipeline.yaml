@@ -1,0 +1,81 @@
+# Harness Code CI (Episode 11) — runs on every PR, must pass before merge.
+pipeline:
+  name: code-repo-pipeline
+  identifier: code_repo_pipeline
+  projectIdentifier: HarnessCICDZerotoHero # ← CHANGE: your Harness project ID
+  orgIdentifier: default # ← CHANGE: your Harness org ID (usually "default")
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        # Harness Code repo: use ONLY repoName (NO connectorRef — Harness Code has no connector)
+        repoName: code-repo-app # ← CHANGE: your Harness Code repo name
+        # Branch comes from the PR/push trigger — no runtime input, so no Input Set is required.
+        build:
+          type: branch
+          spec:
+            branch: <+trigger.branch>
+  stages:
+    # ============================================
+    # STAGE 1: Build & Test (runs on every PR)
+    # ============================================
+    - stage:
+        name: build-and-test
+        identifier: build_and_test
+        description: "Install deps, run unit tests, build Docker image"
+        type: CI
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true # npm cache — faster repeat builds
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              # --- Install dependencies ---
+              - step:
+                  type: Run
+                  name: Install Dependencies
+                  identifier: install_deps
+                  spec:
+                    shell: Sh
+                    image: node:20-alpine
+                    command: |-
+                      npm install
+
+              # --- Run unit tests (the CI gate for PRs) ---
+              - step:
+                  type: Run
+                  name: Run Unit Tests
+                  identifier: run_tests
+                  spec:
+                    shell: Sh
+                    image: node:20-alpine
+                    command: |-
+                      npm test
+
+              # --- Build Docker image (proves the app is shippable) ---
+              - step:
+                  type: BuildAndPushDockerRegistry
+                  name: Build Docker Image
+                  identifier: build_image
+                  spec:
+                    connectorRef: dockerhub # ← CHANGE: your Docker Hub connector
+                    repo: <+variable.docker_username>/code-repo-app # ← CHANGE: your Docker Hub username
+                    tags:
+                      - "<+pipeline.sequenceId>"
+
+              # --- Summary ---
+              - step:
+                  type: Run
+                  name: Build Summary
+                  identifier: build_summary
+                  spec:
+                    shell: Sh
+                    command: |-
+                      echo "Build #<+pipeline.sequenceId> passed."
+                      echo "Tests green. Image built. Safe to merge PR."

@@ -1,0 +1,28 @@
+{
+    "serviceName": "online-shopping",
+    "desiredCount": 2,
+    "launchType": "FARGATE",
+    "deploymentConfiguration": {
+        "maximumPercent": 200,
+        "minimumHealthyPercent": 100
+    },
+    "networkConfiguration": {
+        "awsvpcConfiguration": {
+            "assignPublicIp": "ENABLED",
+            "subnets": [
+                "<+variable.ecs_subnet_1>",
+                "<+variable.ecs_subnet_2>"
+            ],
+            "securityGroups": [
+                "<+variable.ecs_security_group_id>"
+            ]
+        }
+    },
+    "loadBalancers": [
+        {
+            "targetGroupArn": "<+targetGroupArn>",
+            "containerName": "online-shopping",
+            "containerPort": 8080
+        }
+    ]
+}

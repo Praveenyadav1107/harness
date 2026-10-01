@@ -1,0 +1,338 @@
+# ═══════════════════════════════════════════════════════════════════
+# Tracing Module — Jaeger All-in-One + OTel Collector via ArgoCD (Helm)
+# Self-contained: registers its own Helm repos + creates Harness apps
+# ═══════════════════════════════════════════════════════════════════
+
+# Register Helm repos in Harness GitOps
+resource "harness_platform_gitops_repository" "jaeger" {
+  identifier = "helm_jaeger"
+  account_id = var.harness_account_id
+  project_id = var.harness_project_id
+  org_id     = var.harness_org_id
+  agent_id   = var.gitops_agent_id
+  upsert     = true
+  repo {
+    repo            = "https://jaegertracing.github.io/helm-charts"
+    name            = "jaeger"
+    type_           = "helm"
+    insecure        = true
+    connection_type = "HTTPS_ANONYMOUS"
+  }
+}
+
+resource "harness_platform_gitops_repository" "otel" {
+  identifier = "helm_otel"
+  account_id = var.harness_account_id
+  project_id = var.harness_project_id
+  org_id     = var.harness_org_id
+  agent_id   = var.gitops_agent_id
+  upsert     = true
+  repo {
+    repo            = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+    name            = "opentelemetry"
+    type_           = "helm"
+    insecure        = true
+    connection_type = "HTTPS_ANONYMOUS"
+  }
+}
+
+# Jaeger All-in-One — single pod with collector + query + storage
+# Solves the badger storage split issue (collector and query in same process)
+resource "harness_platform_gitops_applications" "jaeger" {
+  identifier = "jaeger"
+  account_id = var.harness_account_id
+  org_id     = var.harness_org_id
+  project_id = var.harness_project_id
+  cluster_id = var.gitops_cluster_id
+  repo_id    = harness_platform_gitops_repository.jaeger.identifier
+  agent_id   = var.gitops_agent_id
+  name       = "jaeger"
+
+  application {
+    metadata {
+      name   = "jaeger"
+      labels = {}
+    }
+    spec {
+      sync_policy {
+        automated {
+          prune     = true
+          self_heal = true
+        }
+        sync_options = ["CreateNamespace=true"]
+      }
+      source {
+        repo_url        = "https://jaegertracing.github.io/helm-charts"
+        chart           = "jaeger"
+        target_revision = "3.1.1"
+        helm {
+          parameters {
+            name  = "allInOne.enabled"
+            value = "true"
+          }
+          parameters {
+            name  = "collector.enabled"
+            value = "false"
+          }
+          parameters {
+            name  = "query.enabled"
+            value = "false"
+          }
+          parameters {
+            name  = "agent.enabled"
+            value = "false"
+          }
+          parameters {
+            name  = "provisionDataStore.cassandra"
+            value = "false"
+          }
+          parameters {
+            name  = "storage.type"
+            value = "badger"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[0].name"
+            value = "COLLECTOR_OTLP_ENABLED"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[0].value"
+            value = "\"true\""
+          }
+          parameters {
+            name  = "allInOne.extraEnv[1].name"
+            value = "BADGER_EPHEMERAL"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[1].value"
+            value = "\"false\""
+          }
+          parameters {
+            name  = "allInOne.extraEnv[2].name"
+            value = "BADGER_DIRECTORY_KEY"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[2].value"
+            value = "/badger/key"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[3].name"
+            value = "BADGER_DIRECTORY_VALUE"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[3].value"
+            value = "/badger/data"
+          }
+          # Expose OTLP ports (4317 gRPC, 4318 HTTP) on the all-in-one pod + service
+          parameters {
+            name  = "allInOne.extraEnv[4].name"
+            value = "COLLECTOR_OTLP_GRPC_HOST_PORT"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[4].value"
+            value = ":4317"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[5].name"
+            value = "COLLECTOR_OTLP_HTTP_HOST_PORT"
+          }
+          parameters {
+            name  = "allInOne.extraEnv[5].value"
+            value = ":4318"
+          }
+          # Persistent storage for badger (survives pod restarts)
+          parameters {
+            name  = "storage.badger.persistence.enabled"
+            value = "true"
+          }
+          parameters {
+            name  = "storage.badger.persistence.size"
+            value = "10Gi"
+          }
+          parameters {
+            name  = "storage.badger.persistence.storageClass"
+            value = "auto-ebs-sc"
+          }
+          parameters {
+            name  = "spark.enabled"
+            value = "false"
+          }
+          parameters {
+            name  = "esIndexCleaner.enabled"
+            value = "false"
+          }
+          parameters {
+            name  = "esRollover.enabled"
+            value = "false"
+          }
+          parameters {
+            name  = "esLookback.enabled"
+            value = "false"
+          }
+        }
+      }
+      destination {
+        server    = "https://kubernetes.default.svc"
+        namespace = "tracing"
+      }
+    }
+  }
+
+  depends_on = [harness_platform_gitops_repository.jaeger]
+}
+
+# OTel Collector — Harness GitOps Application
+resource "harness_platform_gitops_applications" "otel_collector" {
+  identifier = "otelcollector"
+  account_id = var.harness_account_id
+  org_id     = var.harness_org_id
+  project_id = var.harness_project_id
+  cluster_id = var.gitops_cluster_id
+  repo_id    = harness_platform_gitops_repository.otel.identifier
+  agent_id   = var.gitops_agent_id
+  name       = "otel-collector"
+
+  application {
+    metadata {
+      name   = "otel-collector"
+      labels = {}
+    }
+    spec {
+      sync_policy {
+        automated {
+          prune     = true
+          self_heal = true
+        }
+        sync_options = ["CreateNamespace=true"]
+      }
+      source {
+        repo_url        = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+        chart           = "opentelemetry-collector"
+        target_revision = "0.97.1"
+        helm {
+          parameters {
+            name  = "mode"
+            value = "deployment"
+          }
+          parameters {
+            name  = "image.repository"
+            value = "otel/opentelemetry-collector-contrib"
+          }
+          parameters {
+            name  = "image.tag"
+            value = "0.104.0"
+          }
+          values = <<-EOT
+            config:
+              receivers:
+                otlp:
+                  protocols:
+                    grpc:
+                      endpoint: 0.0.0.0:4317
+                    http:
+                      endpoint: 0.0.0.0:4318
+                zipkin:
+                  endpoint: 0.0.0.0:9411
+              exporters:
+                otlp/jaeger:
+                  endpoint: jaeger-otlp:4317
+                  tls:
+                    insecure: true
+                debug:
+                  verbosity: basic
+              processors:
+                batch:
+                  timeout: 5s
+                  send_batch_size: 1024
+              service:
+                pipelines:
+                  traces:
+                    receivers: [otlp, zipkin]
+                    processors: [batch]
+                    exporters: [otlp/jaeger, debug]
+                  metrics:
+                    receivers: [otlp]
+                    processors: [batch]
+                    exporters: [debug]
+            ports:
+              zipkin:
+                enabled: true
+                containerPort: 9411
+                servicePort: 9411
+          EOT
+        }
+      }
+      destination {
+        server    = "https://kubernetes.default.svc"
+        namespace = "tracing"
+      }
+    }
+  }
+
+  depends_on = [harness_platform_gitops_repository.otel]
+}
+
+# Jaeger Ingress
+resource "kubernetes_namespace" "tracing" {
+  metadata { name = "tracing" }
+  lifecycle { ignore_changes = all }
+}
+
+resource "kubectl_manifest" "jaeger_ingress" {
+  yaml_body = yamlencode({
+    apiVersion = "networking.k8s.io/v1"
+    kind       = "Ingress"
+    metadata = {
+      name      = "jaeger-query"
+      namespace = "tracing"
+      annotations = {
+        "konghq.com/strip-path" = "false"
+      }
+    }
+    spec = {
+      ingressClassName = "kong"
+      rules = [{
+        host = "jaeger.${var.domain_name}"
+        http = {
+          paths = [{
+            path     = "/"
+            pathType = "Prefix"
+            backend = {
+              service = {
+                name = "jaeger-query"
+                port = { number = 16686 } # all-in-one query UI port (not 80)
+              }
+            }
+          }]
+        }
+      }]
+    }
+  })
+
+  depends_on = [harness_platform_gitops_applications.jaeger, kubernetes_namespace.tracing]
+}
+
+# OTLP Service — exposes port 4317 on the Jaeger all-in-one pod
+# The all-in-one Helm service only exposes query (16686); OTel Collector needs OTLP gRPC (4317)
+# This dedicated service routes otel-collector → jaeger all-in-one on 4317
+resource "kubectl_manifest" "jaeger_otlp_service" {
+  yaml_body = yamlencode({
+    apiVersion = "v1"
+    kind       = "Service"
+    metadata = {
+      name      = "jaeger-otlp"
+      namespace = "tracing"
+    }
+    spec = {
+      selector = {
+        "app.kubernetes.io/component" = "all-in-one"
+        "app.kubernetes.io/instance"  = "jaeger"
+      }
+      ports = [
+        { name = "otlp-grpc", port = 4317, targetPort = 4317, protocol = "TCP" },
+        { name = "otlp-http", port = 4318, targetPort = 4318, protocol = "TCP" }
+      ]
+    }
+  })
+
+  depends_on = [harness_platform_gitops_applications.jaeger, kubernetes_namespace.tracing]
+}

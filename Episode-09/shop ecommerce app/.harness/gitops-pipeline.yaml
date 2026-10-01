@@ -1,0 +1,317 @@
+# ============================================
+# PIPELINE 2: App Deployment (Run on every code push)
+# ============================================
+# Stage 1: Build Laravel image → Push to ECR
+# Stage 2: GitOps Deploy → PR → Approve → Merge → ArgoCD Sync → Verify
+# ============================================
+pipeline:
+  name: episode9-shop-ecommerce-gitops
+  identifier: episode9_shop_ecommerce_gitops
+  projectIdentifier: HarnessCICDZerotoHero # ← CHANGE: your project ID
+  orgIdentifier: default # ← CHANGE: your org
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Github # ← CHANGE: your GitHub connector
+        repoName: Harness-CI-CD-Zero-to-Hero # ← CHANGE: your repo name
+        build: <+input>
+  stages:
+    # ============================================
+    # STAGE 1: Build & Push to ECR (CI — runs on K8s delegate)
+    # Builds Laravel Docker image, pushes to ECR, creates K8s secrets
+    # ============================================
+    - stage:
+        name: build-and-push
+        identifier: build_and_push
+        description: "Build Docker image and push to ECR"
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate # ← CHANGE: your K8s connector
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+          # NOTE: KubernetesDirect needs connectorRef on every Run step (unlike Harness Cloud)
+          execution:
+            steps:
+              # Step 1: Creates ECR repository if it doesn't exist (idempotent)
+              - step:
+                  type: Run
+                  name: Create ECR Repo
+                  identifier: create_ecr
+                  spec:
+                    connectorRef: dockerhub # ← CHANGE: your Docker Hub connector (for pulling image)
+                    shell: Sh
+                    image: amazon/aws-cli:latest
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+variable.aws_region>
+                    command: |-
+                      aws ecr create-repository --repository-name shop-ecommerce --region <+variable.aws_region> 2>/dev/null || echo "Repository already exists"
+
+              # Step 2: Builds Docker image from Dockerfile and pushes to ECR with version tag
+              - step:
+                  type: BuildAndPushECR
+                  name: Build and Push to ECR
+                  identifier: build_push_ecr
+                  spec:
+                    connectorRef: account.aws_account # ← CHANGE: your AWS OIDC connector
+                    region: <+variable.aws_region>
+                    account: <+variable.aws_account_id>
+                    imageName: shop-ecommerce
+                    tags:
+                      - v<+pipeline.sequenceId>
+                      - latest
+                    dockerfile: "Episode-09/shop ecommerce app/Dockerfile"
+                    context: "Episode-09/shop ecommerce app"
+
+              # Step 3: Creates K8s secret with app credentials (Harness resolves secrets via delegate)
+              - step:
+                  type: Run
+                  name: Create App Secrets
+                  identifier: create_app_secrets
+                  spec:
+                    connectorRef: dockerhub
+                    shell: Sh
+                    image: bitnami/kubectl:latest
+                    envVariables:
+                      SHOP_APP_KEY: <+secrets.getValue("shop_app_key")>
+                      SHOP_DB_USERNAME: <+secrets.getValue("shop_db_username")>
+                      SHOP_DB_PASSWORD: <+secrets.getValue("shop_db_password")>
+                      SHOP_STRIPE_KEY: <+secrets.getValue("shop_stripe_key")>
+                      SHOP_STRIPE_SECRET: <+secrets.getValue("shop_stripe_secret")>
+                      SHOP_MAIL_HOST: <+secrets.getValue("shop_mail_host")>
+                      SHOP_MAIL_USERNAME: <+secrets.getValue("shop_mail_username")>
+                      SHOP_MAIL_PASSWORD: <+secrets.getValue("shop_mail_password")>
+                    command: |-
+                      kubectl create namespace shop-ecommerce 2>/dev/null || true
+                      kubectl delete secret shop-ecommerce-secrets -n shop-ecommerce 2>/dev/null || true
+                      kubectl create secret generic shop-ecommerce-secrets -n shop-ecommerce \
+                        --from-literal=APP_KEY="$SHOP_APP_KEY" \
+                        --from-literal=DB_USERNAME="$SHOP_DB_USERNAME" \
+                        --from-literal=DB_PASSWORD="$SHOP_DB_PASSWORD" \
+                        --from-literal=STRIPE_KEY="$SHOP_STRIPE_KEY" \
+                        --from-literal=STRIPE_SECRET="$SHOP_STRIPE_SECRET" \
+                        --from-literal=MAIL_HOST="$SHOP_MAIL_HOST" \
+                        --from-literal=MAIL_USERNAME="$SHOP_MAIL_USERNAME" \
+                        --from-literal=MAIL_PASSWORD="$SHOP_MAIL_PASSWORD"
+                      echo "=== Secret created in shop-ecommerce namespace ==="
+
+    # ============================================
+    # STAGE 2: GitOps Deploy (PR → Approve → Merge → Sync → Verify)
+    # Pipeline updates Git, ArgoCD agent syncs cluster — no direct kubectl apply
+    # ============================================
+    - stage:
+        name: gitops-deploy
+        identifier: gitops_deploy
+        description: "GitOps PR pipeline — update Git, ArgoCD syncs cluster"
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          gitOpsEnabled: true
+          service:
+            serviceRef: shopecommerce # ← CHANGE: your service ID
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: ecr_image # ← CHANGE: must match artifact ID in your Service
+                      sources:
+                        - identifier: ecr_image
+                          type: Ecr
+                          spec:
+                            tag: v<+pipeline.sequenceId>
+          environment:
+            environmentRef: production # ← CHANGE: your environment ID
+            deployToAll: false
+            gitOpsClusters:
+              - identifier: incluster # ← CHANGE: your GitOps cluster ID
+                agentIdentifier: gitopsagent # ← CHANGE: your GitOps agent ID
+          execution:
+            steps:
+              # Step 1: Updates image tag in values.yaml, creates a PR branch, commits, pushes, and opens a Pull Request
+              - step:
+                  type: GitOpsUpdateReleaseRepo
+                  name: Update Release Repo
+                  identifier: update_release_repo
+                  timeout: 10m
+                  spec:
+                    variables:
+                      - name: image
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/shop-ecommerce:v<+pipeline.sequenceId>
+                    prTitle: "Deploy shop-ecommerce build #<+pipeline.sequenceId>"
+
+              # Step 2: Pipeline pauses — human reviews the PR and approves before merge
+              - step:
+                  type: HarnessApproval
+                  name: Approve Deployment
+                  identifier: approve_deployment
+                  timeout: 1d
+                  spec:
+                    approvalMessage: "Approve deployment of build #<+pipeline.sequenceId> to production"
+                    includePipelineExecutionHistory: true
+                    isAutoRejectEnabled: false
+                    approvers:
+                      userGroups:
+                        - _project_all_users
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                    approverInputs: []
+
+              # Step 3: Merges the PR into main branch (source branch auto-deleted)
+              - step:
+                  type: MergePR
+                  name: Merge PR
+                  identifier: merge_pr
+                  timeout: 10m
+                  spec:
+                    deleteSourceBranch: true
+                    variables: []
+
+              # Step 4: Triggers ArgoCD to sync NOW (instead of waiting 3-min poll interval)
+              - step:
+                  type: GitOpsSync
+                  name: Sync Application
+                  identifier: gitops_sync
+                  timeout: 10m
+                  spec:
+                    prune: true
+                    dryRun: false
+                    applyOnly: false
+                    forceApply: false
+                    applicationsList:
+                      - applicationName: shop-ecommerce # ← CHANGE: your GitOps app name
+                        agentId: gitopsagent # ← CHANGE: your agent ID
+                    retryStrategy: {}
+                    retry: false
+                    syncOptions:
+                      skipSchemaValidation: false
+                      autoCreateNamespace: true
+                      pruneResourcesAtLast: false
+                      applyOutOfSyncOnly: false
+                      replaceResources: false
+                      prunePropagationPolicy: foreground
+
+              # Step 5: Returns real-time app status (Synced/Healthy/Degraded) as JSON output
+              - step:
+                  type: GitOpsGetAppDetails
+                  name: Get App Status
+                  identifier: get_app_status
+                  timeout: 5m
+                  spec:
+                    applicationsList:
+                      - applicationName: shop-ecommerce # ← CHANGE: your GitOps app name
+                        agentId: gitopsagent # ← CHANGE: your agent ID
+
+              # Step 6: Health Check (COMMENTED — cannot use Run step in GitOps stage)
+              # - step:
+              #     type: Run
+              #     name: Health Check
+              #     identifier: health_check
+              #     spec:
+              #       connectorRef: dockerhub
+              #       shell: Sh
+              #       image: bitnami/kubectl:latest
+              #       command: |-
+              #         kubectl wait --for=condition=ready pod -l app=shop-ecommerce -n shop-ecommerce --timeout=180s
+              #         kubectl get pods -n shop-ecommerce
+              #         SVC_IP=$(kubectl get svc shop-ecommerce -n shop-ecommerce -o jsonpath='{.spec.clusterIP}')
+              #         HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$SVC_IP/health --max-time 10)
+              #         echo "HTTP Health: $HTTP_CODE"
+              #         if [ "$HTTP_CODE" != "200" ]; then exit 1; fi
+
+              # Step 6: Continuous Verification — compares pre/post deployment metrics from Prometheus
+              # Auto-triggers rollback if error rate or latency degrades
+              # - step:
+              #     type: Verify
+              #     name: Verify Deployment
+              #     identifier: verify_deployment
+              #     timeout: 15m
+              #     spec:
+              #       isMultiServicesOrEnvs: false
+              #       type: Rolling
+              #       monitoredService:
+              #         type: Default
+              #         spec: {}
+              #       spec:
+              #         sensitivity: MEDIUM
+              #         duration: 5m
+              #         deploymentTag: <+pipeline.sequenceId>
+
+            # ============================================
+            # ROLLBACK STEPS (auto-triggered on failure)
+            # If GitOpsSync or GetAppDetails fails:
+            #   1. RevertPR: Creates a revert commit undoing the image tag change
+            #   2. Merge Revert PR: Merges the revert into main (values.yaml goes back to old tag)
+            #   3. Rollback Sync: ArgoCD syncs to reverted state (deploys previous version)
+            # ============================================
+            rollbackSteps:
+              # Rollback Step 1: Creates a new PR that reverts the commit made by UpdateReleaseRepo
+              - step:
+                  type: RevertPR
+                  name: Revert PR
+                  identifier: revert_pr
+                  timeout: 10m
+                  spec:
+                    commitId: <+pipeline.stages.gitops_deploy.spec.execution.steps.update_release_repo.updateReleaseRepoOutcome.commitId>
+
+              # Rollback Step 2: Merges the revert PR so main branch has the old image tag again
+              - step:
+                  type: MergePR
+                  name: Merge Revert PR
+                  identifier: merge_revert_pr
+                  timeout: 10m
+                  spec:
+                    deleteSourceBranch: true
+
+              # Rollback Step 3: Forces ArgoCD to sync NOW — deploys the old version back
+              - step:
+                  type: GitOpsSync
+                  name: Rollback Sync
+                  identifier: rollback_sync
+                  timeout: 10m
+                  spec:
+                    prune: true
+                    dryRun: false
+                    applyOnly: false
+                    forceApply: false
+                    applicationsList:
+                      - applicationName: shop-ecommerce # ← CHANGE: your GitOps app name
+                        agentId: gitopsagent # ← CHANGE: your agent ID
+                    retryStrategy: {}
+                    retry: false
+                    syncOptions:
+                      skipSchemaValidation: false
+                      autoCreateNamespace: false
+                      pruneResourcesAtLast: false
+                      applyOutOfSyncOnly: false
+                      replaceResources: false
+                      prunePropagationPolicy: foreground
+        tags: {}
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        gitOpsEnabled: true
+
+  # Slack notification on success/failure
+  notificationRules:
+    - name: Pipeline Notifications
+      enabled: true
+      pipelineEvents:
+        - type: PipelineSuccess
+        - type: PipelineFailed
+      notificationMethod:
+        type: Slack
+        spec:
+          webhookUrl: <+secrets.getValue("slack_webhook_url")>

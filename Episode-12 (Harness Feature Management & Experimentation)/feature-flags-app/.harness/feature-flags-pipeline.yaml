@@ -1,0 +1,177 @@
+# ============================================
+# PIPELINE: Episode 12 — Feature Management & Experimentation (Free Plan)
+# ============================================
+# Stage 1: Build & Push feature-flags-app to ECR (CI)
+# Stage 2: Deploy to EKS with Helm (NativeHelm) — SDK key from Harness Secret Manager
+#
+# After deploy you toggle the "new_checkout_banner" flag in Harness — NO redeploy.
+# Uses Harness Built-in Secret Manager (works on free plan). No AWS SM / ESO needed.
+#
+# ============================================
+# CHANGE THESE VALUES:
+# ============================================
+#   projectIdentifier: HarnessCICDZerotoHero
+#   orgIdentifier: default
+#   connectorRef: account.Github
+#   repoName: Harness-CI-CD-Zero-to-Hero
+#   connectorRef: account.aws_account
+#   serviceRef: feature_flags_app
+#   environmentRef: production
+#   infrastructureDefinitions: k8sdelegate
+#   secret: harness_ff_sdk_key   (Server SDK key from Feature Flags env)
+# ============================================
+pipeline:
+  name: episode12-feature-flags
+  identifier: episode12_feature_flags
+  # CHANGE THIS: Your project ID
+  projectIdentifier: HarnessCICDZerotoHero
+  # CHANGE THIS: Your org name
+  orgIdentifier: default
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        # CHANGE THIS: Your GitHub connector
+        connectorRef: account.Github
+        # CHANGE THIS: Your repo name
+        repoName: Harness-CI-CD-Zero-to-Hero
+        build: <+input>
+  stages:
+    # ============================================
+    # STAGE 1: Build & Push feature-flags-app to ECR
+    # ============================================
+    - stage:
+        name: build-and-push
+        identifier: build_and_push
+        description: "Run tests, create ECR repo, build & push image"
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Unit Tests
+                  identifier: unit_tests
+                  spec:
+                    shell: Sh
+                    image: node:20-alpine
+                    command: |-
+                      cd "Episode-12 (Harness Feature Management & Experimentation)/feature-flags-app"
+                      npm install
+                      npm test
+
+              - step:
+                  type: Run
+                  name: Create ECR Repo
+                  identifier: create_ecr
+                  spec:
+                    shell: Sh
+                    image: amazon/aws-cli:latest
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+variable.aws_region>
+                    command: |-
+                      aws ecr create-repository --repository-name feature-flags-app --region <+variable.aws_region> 2>/dev/null || true
+
+              - step:
+                  type: BuildAndPushECR
+                  name: Push Image
+                  identifier: push_image
+                  spec:
+                    # CHANGE THIS: Your AWS OIDC connector
+                    connectorRef: account.aws_account
+                    region: <+variable.aws_region>
+                    account: <+variable.aws_account_id>
+                    imageName: feature-flags-app
+                    tags:
+                      - v<+pipeline.sequenceId>
+                      - latest
+                    dockerfile: "Episode-12 (Harness Feature Management & Experimentation)/feature-flags-app/Dockerfile"
+                    context: "Episode-12 (Harness Feature Management & Experimentation)/feature-flags-app"
+
+    # ============================================
+    # STAGE 2: Deploy to EKS with Helm (CD)
+    # SDK key comes from Harness Built-in Secret Manager (via chart values.yaml)
+    # ============================================
+    - stage:
+        name: deploy-helm
+        identifier: deploy_helm
+        description: "Deploy the app to EKS using its Helm chart"
+        type: Deployment
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        spec:
+          deploymentType: NativeHelm
+          service:
+            # CHANGE THIS: Your service ID (create in CD → Services → Kubernetes + Helm Chart)
+            serviceRef: feature_flags_app
+            serviceInputs:
+              serviceDefinition:
+                type: NativeHelm
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: ecr_image
+                      sources:
+                        - identifier: ecr_image
+                          type: Ecr
+                          spec:
+                            tag: v<+pipeline.sequenceId>
+          environment:
+            # CHANGE THIS: Your environment ID
+            environmentRef: production
+            deployToAll: false
+            infrastructureDefinitions:
+              # CHANGE THIS: Your infrastructure ID
+              - identifier: k8sdelegate
+          execution:
+            steps:
+              - step:
+                  name: Helm Deploy
+                  identifier: helm_deploy
+                  type: HelmDeploy
+                  timeout: 10m
+                  spec:
+                    skipDryRun: false
+                    commandFlags:
+                      # --create-namespace creates feature-flags namespace if missing
+                      - commandType: Install
+                        flag: "--create-namespace"
+                      - commandType: Upgrade
+                        flag: "--create-namespace"
+
+              - step:
+                  type: ShellScript
+                  name: Health Check
+                  identifier: health_check
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          kubectl wait --for=condition=ready pod -l app=feature-flags-app -n feature-flags --timeout=120s
+                          kubectl get svc -n feature-flags
+                          echo "Health Check PASSED"
+                  timeout: 5m
+
+            rollbackSteps:
+              - step:
+                  name: Helm Rollback
+                  identifier: helm_rollback
+                  type: HelmRollback
+                  timeout: 10m
+                  spec: {}

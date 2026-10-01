@@ -1,0 +1,882 @@
+# ============================================
+# ENTERPRISE GITOPS PIPELINE (Episode 10 — MNC Production Way)
+# ============================================
+# Stage 1: CI — Build all microservice images + Push to ECR
+# Stage 2: AI Security Agent — Analyze scan results
+# Stage 3: AI Deployment Risk Agent — SAFE/RISKY/BLOCK
+# Stage 4: GitOps Deploy — PR → Approve → Merge → Sync → Verify
+# ============================================
+pipeline:
+  name: ep10-enterprise-gitops
+  identifier: ep10_enterprise_gitops
+  projectIdentifier: HarnessCICDZerotoHero # ← CHANGE: your project ID
+  orgIdentifier: default # ← CHANGE: your org
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Github # ← CHANGE: your GitHub connector
+        repoName: Harness-CI-CD-Zero-to-Hero # ← CHANGE: your repo name
+        build: <+input>
+  stages:
+    # ============================================
+    # STAGE 1: Build & Push to ECR (KubernetesDirect — MNC way)
+    # Builds run on YOUR EKS cluster (code never leaves VPC)
+    # ============================================
+    - stage:
+        name: security-scans
+        identifier: security_scans
+        description: "DevSecOps security scanning (Gitleaks, Trivy, OWASP, SonarQube)"
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate # ← CHANGE: your K8s connector
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+              nodeSelector:
+                purpose: ci-builds
+              tolerations:
+                - key: dedicated
+                  value: ci-builds
+                  effect: NoSchedule
+          execution:
+            steps:
+              - parallel:
+                  - step:
+                      type: Run
+                      name: Gitleaks Scan
+                      identifier: gitleaks
+                      spec:
+                        connectorRef: dockerhub # ← CHANGE: your Docker Hub connector (same for all Run steps below)
+                        shell: Sh
+                        image: zricethezav/gitleaks:latest
+                        command: |-
+                          gitleaks detect --source=/harness --no-git --report-format json --report-path /harness/gitleaks-report.json || true
+                          echo "--- Gitleaks Report ---"
+                          cat /harness/gitleaks-report.json
+                          LEAKS=$(cat /harness/gitleaks-report.json | grep -c '"RuleID"' || echo "0")
+                          if [ "$LEAKS" -gt 0 ]; then echo "FAILED: $LEAKS leaks found"; exit 1; fi
+
+                  - step:
+                      type: Run
+                      name: Trivy Scan
+                      identifier: trivy
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: aquasec/trivy:latest
+                        command: |-
+                          trivy fs --severity HIGH,CRITICAL --format table --exit-code 0 /harness/Episode-10/src/
+
+                  - step:
+                      type: Run
+                      name: OSV Dependency Scan
+                      identifier: owasp
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: alpine:3.19
+                        command: |-
+                          apk add --no-cache curl
+                          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+                          chmod +x /usr/local/bin/osv-scanner
+                          (osv-scanner --recursive --format table /harness/Episode-10/src/ || true)
+
+                  - step:
+                      type: Run
+                      name: SonarQube Analysis
+                      identifier: sonarqube
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: sonarsource/sonar-scanner-cli:latest
+                        envVariables:
+                          SONAR_HOST_URL: <+variable.sonar_host_url>
+                          SONAR_TOKEN: <+secrets.getValue("sonar_token")>
+                          SONAR_USER_HOME: /tmp/.sonar
+                        command: |-
+                          cd /harness/Episode-10
+                          sonar-scanner \
+                            -Dsonar.host.url=$SONAR_HOST_URL \
+                            -Dsonar.token=$SONAR_TOKEN
+                        resources:
+                          limits:
+                            memory: 3Gi
+
+                  - step:
+                      type: Run
+                      name: Checkov IaC Scan
+                      identifier: checkov
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: bridgecrew/checkov:latest
+                        command: |-
+                          checkov --directory /harness/Episode-10/terraform --framework terraform --output cli --config-file /harness/Episode-10/.checkov.yaml
+                          checkov --directory /harness/Episode-10/k8s --framework kubernetes --output cli --config-file /harness/Episode-10/.checkov.yaml
+
+    # ============================================
+    # STAGE 1b: Build & Push to ECR (Docker Layer Caching enabled — 10x faster on repeat builds)
+    # Remote Cache (remoteCacheRepo) - kaniko caches layers in ECR, no Docker daemon needed
+    # ============================================
+    - stage:
+        name: build-and-push
+        identifier: build_and_push
+        description: "Build 11 microservice images and push to ECR (Remote Cache enabled)"
+        type: CI
+        spec:
+          cloneCodebase: true
+          # sharedPaths — required for S3 cache to access directories outside /harness workspace
+          sharedPaths:
+            - /root/.cache/go-build
+            - /root/go/pkg/mod
+            - /root/.npm
+            - /root/.gradle/caches
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate # ← CHANGE: your K8s connector
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+              nodeSelector:
+                purpose: ci-builds
+              tolerations:
+                - key: dedicated
+                  value: ci-builds
+                  effect: NoSchedule
+          execution:
+            steps:
+              # Restore cached build dependencies from S3 (Go modules, npm packages, Gradle deps)
+              - step:
+                  type: RestoreCacheS3
+                  name: Restore Cache
+                  identifier: restore_cache
+                  spec:
+                    connectorRef: account.aws_account # ← CHANGE: your AWS OIDC connector
+                    region: <+variable.aws_region>
+                    bucket: <+variable.ci_cache_bucket>
+                    key: ep10-build-cache
+                    archiveFormat: Tar
+                    pathStyle: false
+                    failIfKeyNotFound: false
+              # Build and push all microservices (3 per batch — fits on t3a.xlarge 16GB)
+              ###########################################################
+              # 3 parallel × 3Gi = 9GB used → fits in 16GB node comfortably
+              # 3 parallel × 4Gi = 12GB used → fits but tight (OS + kubelet + delegate also need RAM)
+              # 4 parallel × 4Gi = 16GB → all 16GB used, no RAM left for OS/kubelet → OOMKilled ❌
+              ###########################################################
+              # Docker Layer Caching — uses  BuildKit + ECR remote cache for microservice builds
+              # First run: full build. Second run onwards: only changed layers rebuild (~30s per service)
+              ###########################################################
+              # Batch 1: Frontend(Go) + CartService(.NET) + CheckoutService(Go)
+              - parallel:
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push Frontend
+                      identifier: push_frontend
+                      spec:
+                        connectorRef: account.aws_account # ← CHANGE: your AWS OIDC connector (same for all push steps below)
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: frontend
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/frontend/Dockerfile
+                        context: Episode-10/src/frontend
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 4Gi # Go multi-stage build needs 4 GB RAM
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push CartService
+                      identifier: push_cartservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: cartservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/cartservice/src/Dockerfile
+                        context: Episode-10/src/cartservice/src
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 4Gi # 4 GB RAM limit for this build step
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push CheckoutService
+                      identifier: push_checkoutservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: checkoutservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/checkoutservice/Dockerfile
+                        context: Episode-10/src/checkoutservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 3Gi # 3 GB RAM limit for this build step
+
+              # Batch 2: ProductCatalog(Go) + CurrencyService(Node.js) + EmailService(Python)
+              - parallel:
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push ProductCatalog
+                      identifier: push_productcatalog
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: productcatalogservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/productcatalogservice/Dockerfile
+                        context: Episode-10/src/productcatalogservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 3Gi # 3 GB RAM limit for this build step
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push CurrencyService
+                      identifier: push_currencyservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: currencyservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/currencyservice/Dockerfile
+                        context: Episode-10/src/currencyservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 2Gi # Node.js build 2 GB RAM  limit
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push EmailService
+                      identifier: push_emailservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: emailservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/emailservice/Dockerfile
+                        context: Episode-10/src/emailservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 2Gi # Python build memory limit
+
+              # Batch 3: PaymentService(Node.js) + RecommendationService(Python) + ShippingService(Go)
+              - parallel:
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push PaymentService
+                      identifier: push_paymentservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: paymentservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/paymentservice/Dockerfile
+                        context: Episode-10/src/paymentservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 2Gi # 2 GB RAM limit for this build step
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push RecommendationService
+                      identifier: push_recommendationservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: recommendationservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/recommendationservice/Dockerfile
+                        context: Episode-10/src/recommendationservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 2Gi # 2 GB RAM limit for this build step
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push ShippingService
+                      identifier: push_shippingservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: shippingservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/shippingservice/Dockerfile
+                        context: Episode-10/src/shippingservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 3Gi # 3 GB RAM limit for this build step
+
+              # Batch 4: AdService(Java/Gradle) + LoadGenerator(Python)
+              - parallel:
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push AdService
+                      identifier: push_adservice
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: adservice
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/adservice/Dockerfile
+                        context: Episode-10/src/adservice
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 4Gi # 4 GB RAM limit for this build step
+
+                  - step:
+                      type: BuildAndPushECR
+                      name: Push LoadGenerator
+                      identifier: push_loadgenerator
+                      spec:
+                        connectorRef: account.aws_account
+                        region: <+variable.aws_region>
+                        account: <+variable.aws_account_id>
+                        imageName: loadgenerator
+                        tags:
+                          - v<+pipeline.sequenceId>
+                        dockerfile: Episode-10/src/loadgenerator/Dockerfile
+                        context: Episode-10/src/loadgenerator
+                        remoteCacheRepo: cache # Remote Cache — stores layers in ECR 'cache' repo
+                        resources:
+                          limits:
+                            memory: 2Gi # Python build memory limit
+
+              # Save build dependencies to S3 cache (next pipeline run will be faster)
+              - step:
+                  type: Run
+                  name: Prepare Cache Dirs
+                  identifier: prepare_cache
+                  spec:
+                    connectorRef: dockerhub
+                    shell: Sh
+                    image: alpine:3.19
+                    command: |-
+                      mkdir -p /root/.cache/go-build /root/go/pkg/mod /root/.npm /root/.gradle/caches
+              - step:
+                  type: SaveCacheS3
+                  name: Save Cache
+                  identifier: save_cache
+                  spec:
+                    connectorRef: account.aws_account
+                    region: <+variable.aws_region>
+                    bucket: <+variable.ci_cache_bucket>
+                    key: ep10-build-cache
+                    sourcePaths:
+                      - /root/.cache/go-build
+                      - /root/go/pkg/mod
+                      - /root/.npm
+                      - /root/.gradle/caches
+                    archiveFormat: Tar
+                    pathStyle: false
+                    override: true
+              # Results: AWS Console -> ECR -> Repositories -> Image -> Vulnerabilities tab
+
+    # ============================================
+    # STAGE 2: AI Agents (5 agents - security, code review, release notes, risk, logs)
+    # ============================================
+    - stage:
+        name: ai-agents
+        identifier: ai_agents
+        description: "5 AI agents analyze security, code, risk, logs, and generate release notes"
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate # ← CHANGE: your K8s connector
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+              nodeSelector:
+                purpose: ci-builds
+              tolerations:
+                - key: dedicated
+                  value: ci-builds
+                  effect: NoSchedule
+          execution:
+            steps:
+              # Parallel 1: Security + Code Review + Release Notes
+              - parallel:
+                  - step:
+                      type: Run
+                      name: AI Security Agent
+                      identifier: ai_security_agent
+                      spec:
+                        connectorRef: dockerhub # ← CHANGE: your Docker Hub connector (same for all AI agent steps)
+                        shell: Sh
+                        image: python:3.11-slim
+                        envVariables:
+                          AI_API_KEY: <+secrets.getValue("ai_api_key")>
+                        command: |-
+                          apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+                          cd /harness/Episode-10/ai-agents
+                          python security_agent.py || true
+
+                  - step:
+                      type: Run
+                      name: AI Code Review Agent
+                      identifier: ai_code_review_agent
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: python:3.11-slim
+                        envVariables:
+                          AI_API_KEY: <+secrets.getValue("ai_api_key")>
+                        command: |-
+                          apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+                          git config --global --add safe.directory /harness
+                          cd /harness/Episode-10/ai-agents
+                          # Get list of recently changed files from git log
+                          FILES=$(git -C /harness log --oneline -5 --name-only --pretty=format: | sort -u | grep -E '\.(py|go|js|ts|java|tf|yaml)$' | head -10 | tr '\n' ',')
+                          if [ -n "$FILES" ]; then
+                            python code_review_agent.py --files "$FILES" || true
+                          else
+                            python code_review_agent.py --files "Episode-10/ai-agents/ai_provider.py,Episode-10/ai-agents/security_agent.py" || true
+                          fi
+
+                  - step:
+                      type: Run
+                      name: AI Release Notes Agent
+                      identifier: ai_release_notes_agent
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: python:3.11-slim
+                        envVariables:
+                          AI_API_KEY: <+secrets.getValue("ai_api_key")>
+                        command: |-
+                          apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+                          cd /harness/Episode-10/ai-agents
+                          python release_notes_agent.py --commits 20 || true
+
+              # Parallel 2: Deployment Risk + Log Analysis
+              - parallel:
+                  - step:
+                      type: Run
+                      name: AI Deployment Risk Agent
+                      identifier: ai_risk_agent
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: python:3.11-slim
+                        envVariables:
+                          AI_API_KEY: <+secrets.getValue("ai_api_key")>
+                        command: |-
+                          apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+                          git config --global --add safe.directory /harness
+                          cd /harness/Episode-10/ai-agents
+                          CHANGES=$(git -C /harness log --oneline -20 | wc -l)
+                          python deployment_risk_agent.py \
+                            --environment production \
+                            --test-status passed \
+                            --security-status passed \
+                            --changes $CHANGES \
+                            --trivy-critical 0 \
+                            --secrets-found 0 || true
+
+                  - step:
+                      type: Run
+                      name: AI Log Analysis Agent
+                      identifier: ai_log_analysis_agent
+                      spec:
+                        connectorRef: dockerhub
+                        shell: Sh
+                        image: python:3.11-slim
+                        envVariables:
+                          AI_API_KEY: <+secrets.getValue("ai_api_key")>
+                        command: |-
+                          apt-get update -qq && apt-get install -y -qq git curl > /dev/null 2>&1
+                          git config --global --add safe.directory /harness
+                          cd /harness/Episode-10/ai-agents
+                          # Get real git log as input for log analysis
+                          git -C /harness log --oneline -20 > /tmp/recent-changes.log 2>/dev/null || echo "No logs" > /tmp/recent-changes.log
+                          python log_analysis_agent.py --logs /tmp/recent-changes.log --type application || true
+
+    # ============================================
+    # STAGE 3: GitOps Deploy (PR -> Approve -> Merge -> Sync -> Verify)
+    # This is the MNC production deployment pattern
+    # ============================================
+    - stage:
+        name: gitops-deploy
+        identifier: gitops_deploy
+        description: "GitOps PR pipeline — update Git, ArgoCD syncs cluster"
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          gitOpsEnabled: true
+          service:
+            serviceRef: online_boutique # ← CHANGE: your service ID
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      sources:
+                        - identifier: ecr_frontend
+                          type: Ecr
+                          spec:
+                            tag: v<+pipeline.sequenceId>
+          environment:
+            environmentRef: production # ← CHANGE: your environment ID
+            deployToAll: false
+            gitOpsClusters:
+              - identifier: incluster # ← CHANGE: your GitOps cluster ID
+                agentIdentifier: ep10gitopsagent # ← CHANGE: your GitOps agent ID
+          execution:
+            steps:
+              # Step 1: Update ALL image tags in values.yaml via PR
+              - step:
+                  type: GitOpsUpdateReleaseRepo
+                  name: Update Release Repo
+                  identifier: update_release_repo
+                  timeout: 10m
+                  spec:
+                    variables:
+                      - name: frontendImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/frontend:v<+pipeline.sequenceId>
+                      - name: cartserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/cartservice:v<+pipeline.sequenceId>
+                      - name: checkoutserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/checkoutservice:v<+pipeline.sequenceId>
+                      - name: productcatalogserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/productcatalogservice:v<+pipeline.sequenceId>
+                      - name: currencyserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/currencyservice:v<+pipeline.sequenceId>
+                      - name: emailserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/emailservice:v<+pipeline.sequenceId>
+                      - name: paymentserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/paymentservice:v<+pipeline.sequenceId>
+                      - name: recommendationserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/recommendationservice:v<+pipeline.sequenceId>
+                      - name: shippingserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/shippingservice:v<+pipeline.sequenceId>
+                      - name: adserviceImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/adservice:v<+pipeline.sequenceId>
+                      - name: loadgeneratorImage
+                        type: String
+                        value: <+variable.aws_account_id>.dkr.ecr.<+variable.aws_region>.amazonaws.com/loadgenerator:v<+pipeline.sequenceId>
+                    prTitle: "Deploy Online Boutique build #<+pipeline.sequenceId>"
+
+              # Step 2: Human approval before merge to production
+              - step:
+                  type: HarnessApproval
+                  name: Approve Deployment
+                  identifier: approve_deployment
+                  timeout: 1d
+                  spec:
+                    approvalMessage: "Approve deployment of build #<+pipeline.sequenceId> to production (10 microservices)"
+                    includePipelineExecutionHistory: true
+                    isAutoRejectEnabled: false
+                    approvers:
+                      userGroups:
+                        - _project_all_users
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+
+              # Step 3: Merge PR into main (ArgoCD watches main branch)
+              - step:
+                  type: MergePR
+                  name: Merge PR
+                  identifier: merge_pr
+                  timeout: 10m
+                  spec:
+                    deleteSourceBranch: true
+
+              # Step 4: Trigger immediate ArgoCD sync (don't wait 3-min poll)
+              - step:
+                  type: GitOpsSync
+                  name: Sync Application
+                  identifier: gitops_sync
+                  timeout: 10m
+                  spec:
+                    prune: true
+                    dryRun: false
+                    applyOnly: false
+                    forceApply: false
+                    applicationsList:
+                      - applicationName: online-boutique # ← CHANGE: your GitOps app name
+                        agentId: ep10gitopsagent # ← CHANGE: your GitOps agent ID
+                    retry: false
+                    syncOptions:
+                      skipSchemaValidation: false
+                      autoCreateNamespace: true
+                      pruneResourcesAtLast: false
+                      applyOutOfSyncOnly: false
+                      replaceResources: false
+                      prunePropagationPolicy: foreground
+
+              # Step 5: Check application health — if ArgoCD reports Degraded, rollback triggers
+              - step:
+                  type: GitOpsGetAppDetails
+                  name: Get App Status
+                  identifier: get_app_status
+                  timeout: 5m
+                  spec:
+                    applicationsList:
+                      - applicationName: online-boutique # ← CHANGE: your GitOps app name
+                        agentId: ep10gitopsagent # ← CHANGE: your GitOps agent ID
+
+              # Step 6: Continuous Verification
+              # Continuous Verification - compares metrics before vs after deploy
+              # Uses Auto type: picks best strategy based on available baseline data
+              # First deploy: uses canary-like analysis (no previous baseline needed)
+              # Subsequent deploys: uses rolling comparison (before vs after)
+              - step:
+                  type: Verify
+                  name: Verify Deployment
+                  identifier: verify_deployment
+                  timeout: 15m
+                  spec:
+                    isMultiServicesOrEnvs: false
+                    type: Auto
+                    monitoredService:
+                      type: Default
+                      spec: {}
+                    spec:
+                      sensitivity: LOW
+                      duration: 5m
+                      deploymentTag: <+pipeline.sequenceId>
+
+            # ============================================
+            # ROLLBACK (auto-triggered on failure)
+            # Reverts Git commit → ArgoCD syncs old version
+            # ============================================
+            rollbackSteps:
+              - step:
+                  type: RevertPR
+                  name: Revert PR
+                  identifier: revert_pr
+                  timeout: 10m
+                  spec:
+                    commitId: <+pipeline.stages.gitops_deploy.spec.execution.steps.update_release_repo.updateReleaseRepoOutcome.commitId>
+
+              - step:
+                  type: MergePR
+                  name: Merge Revert PR
+                  identifier: merge_revert_pr
+                  timeout: 10m
+                  spec:
+                    deleteSourceBranch: true
+
+              - step:
+                  type: GitOpsSync
+                  name: Rollback Sync
+                  identifier: rollback_sync
+                  timeout: 10m
+                  spec:
+                    prune: true
+                    dryRun: false
+                    applyOnly: false
+                    forceApply: false
+                    applicationsList:
+                      - applicationName: online-boutique # ← CHANGE: your GitOps app name
+                        agentId: ep10gitopsagent # ← CHANGE: your GitOps agent ID
+                    retry: false
+                    syncOptions:
+                      skipSchemaValidation: false
+                      autoCreateNamespace: false
+                      pruneResourcesAtLast: false
+                      applyOutOfSyncOnly: false
+                      replaceResources: false
+                      prunePropagationPolicy: foreground
+        tags: {}
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+        gitOpsEnabled: true
+
+    # ============================================
+    # STAGE 6: OWASP ZAP — Dynamic Application Security Testing (DAST)
+    # Scans the LIVE deployed application for web vulnerabilities (XSS, SQL injection, etc.)
+    # Runs AFTER deployment because DAST needs a running application to test against
+    # ============================================
+    - stage:
+        name: dast-owasp-zap
+        identifier: dast_owasp_zap
+        description: "OWASP ZAP baseline scan against live application URL"
+        type: CI
+        spec:
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8sdelegate # ← CHANGE: your K8s connector
+              namespace: harness-delegate-ng
+              automountServiceAccountToken: true
+              os: Linux
+              nodeSelector:
+                purpose: ci-builds
+              tolerations:
+                - key: dedicated
+                  value: ci-builds
+                  effect: NoSchedule
+          execution:
+            steps:
+              # OWASP ZAP baseline scan — spiders the app for 1 minute, then passive scans all responses
+              - step:
+                  type: Run
+                  name: OWASP ZAP Baseline Scan
+                  identifier: owasp_zap_scan
+                  spec:
+                    connectorRef: dockerhub # ← CHANGE: your Docker Hub connector
+                    shell: Sh
+                    image: ghcr.io/zaproxy/zaproxy:stable
+                    resources:
+                      limits:
+                        memory: 4Gi
+                    command: |-
+                      echo "============================================"
+                      echo "  OWASP ZAP — Dynamic Application Security Test"
+                      echo "  Target: https://app.<+variable.domain_name>"
+                      echo "============================================"
+                      # ZAP baseline hardcodes /zap/wrk as work dir and prepends it to -r/-J.
+                      # Root cause of "NoSuchFileException /zap/wrk/zap/wrk/...": passing a full path.
+                      # FIX: pass ONLY the filename (no path) so ZAP writes to /zap/wrk/<file>.
+                      # Ensure /zap/wrk exists and is writable by the zap user.
+                      mkdir -p /zap/wrk && chmod 777 /zap/wrk 2>/dev/null || true
+                      zap-baseline.py -t https://app.<+variable.domain_name> \
+                        -r zap-report.html \
+                        -J zap-report.json \
+                        -I || true
+
+                      # ZAP wrote reports to /zap/wrk — copy them to the Harness workspace
+                      cp /zap/wrk/zap-report.html /harness/zap-report.html 2>/dev/null || true
+                      cp /zap/wrk/zap-report.json /harness/zap-report.json 2>/dev/null || true
+
+                      echo ""
+                      echo "============================================"
+                      echo "  ZAP SCAN RESULTS SUMMARY"
+                      echo "============================================"
+                      echo ""
+
+                      # Parse JSON report for readable table output (read from /harness copy)
+                      if [ -f /harness/zap-report.json ]; then
+                        echo "| Risk Level | Alert Count |"
+                        echo "|------------|-------------|"
+                        HIGH=$(python3 -c "import json; d=json.load(open('/harness/zap-report.json')); print(len([a for s in d.get('site',[]) for a in s.get('alerts',[]) if a.get('riskcode','0')=='3']))" 2>/dev/null || echo "0")
+                        MEDIUM=$(python3 -c "import json; d=json.load(open('/harness/zap-report.json')); print(len([a for s in d.get('site',[]) for a in s.get('alerts',[]) if a.get('riskcode','0')=='2']))" 2>/dev/null || echo "0")
+                        LOW=$(python3 -c "import json; d=json.load(open('/harness/zap-report.json')); print(len([a for s in d.get('site',[]) for a in s.get('alerts',[]) if a.get('riskcode','0')=='1']))" 2>/dev/null || echo "0")
+                        INFO=$(python3 -c "import json; d=json.load(open('/harness/zap-report.json')); print(len([a for s in d.get('site',[]) for a in s.get('alerts',[]) if a.get('riskcode','0')=='0']))" 2>/dev/null || echo "0")
+                        echo "| HIGH       | $HIGH       |"
+                        echo "| MEDIUM     | $MEDIUM     |"
+                        echo "| LOW        | $LOW        |"
+                        echo "| INFO       | $INFO       |"
+                        echo ""
+                        echo "--- ALERT DETAILS ---"
+                        python3 -c "
+                      import json
+                      d=json.load(open('/harness/zap-report.json'))
+                      risks={3:'HIGH',2:'MEDIUM',1:'LOW',0:'INFO'}
+                      for site in d.get('site',[]):
+                        for alert in site.get('alerts',[]):
+                          risk=risks.get(int(alert.get('riskcode',0)),'?')
+                          name=alert.get('name','Unknown')
+                          count=len(alert.get('instances',[]))
+                          print(f'  [{risk}] {name} ({count} instances)')
+                      " 2>/dev/null || echo "  (Could not parse alerts)"
+                      else
+                        echo "  JSON report not available. Showing console PASS/WARN/FAIL summary above."
+                      fi
+
+                      # Upload reports to S3 folder "zap-reports/" (HTML + JSON) for browser access
+                      # Install AWS CLI (ZAP image is Debian-based — try pip then apt)
+                      if ! command -v aws >/dev/null 2>&1; then
+                        pip install awscli -q || \
+                        (apt-get update -qq && apt-get install -y -qq awscli) || true
+                      fi
+                      # Force AWS CLI to use the EC2 node instance profile via IMDS (v2)
+                      # (Harness CI pod has no SA credentials — must reach node metadata endpoint)
+                      export AWS_EC2_METADATA_DISABLED=false
+                      export AWS_DEFAULT_REGION=<+variable.aws_region>
+                      export AWS_REGION=<+variable.aws_region>
+                      BUCKET="<+variable.ci_cache_bucket>"
+                      REPORT_KEY="zap-reports/zap-report-<+pipeline.sequenceId>.html"
+                      JSON_KEY="zap-reports/zap-report-<+pipeline.sequenceId>.json"
+                      echo "Uploading reports to s3://${BUCKET}/zap-reports/ ..."
+                      aws s3 cp /harness/zap-report.html "s3://${BUCKET}/${REPORT_KEY}" --content-type "text/html" || echo "HTML upload failed"
+                      aws s3 cp /harness/zap-report.json "s3://${BUCKET}/${JSON_KEY}" --content-type "application/json" || echo "JSON upload failed"
+
+                      # Generate presigned URL (valid 7 days)
+                      REPORT_URL=$(aws s3 presign "s3://${BUCKET}/${REPORT_KEY}" --expires-in 604800 2>/dev/null || echo "")
+
+                      echo ""
+                      echo "============================================"
+                      echo "  URLs Scanned: $(grep -c 'url' /harness/zap-report.json 2>/dev/null || echo 'N/A')"
+                      echo "  HTML Report: /harness/zap-report.html"
+                      echo "  JSON Report: /harness/zap-report.json"
+                      echo "============================================"
+                      echo ""
+                      if [ -n "$REPORT_URL" ]; then
+                        echo "============================================"
+                        echo "  📄 VIEW FULL HTML REPORT (click/copy link):"
+                        echo ""
+                        echo "  $REPORT_URL"
+                        echo ""
+                        echo "  (Link valid for 7 days)"
+                        echo "============================================"
+                      fi
+
+  # Slack notification on success/failure
+  notificationRules:
+    - name: Pipeline Notifications
+      enabled: true
+      pipelineEvents:
+        - type: PipelineSuccess
+        - type: PipelineFailed
+      notificationMethod:
+        type: Slack
+        spec:
+          webhookUrl: <+secrets.getValue("slack_webhook_url")>

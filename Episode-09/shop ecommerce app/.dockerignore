@@ -1,0 +1,17 @@
+node_modules
+vendor
+.git
+.gitignore
+.env
+.env.example
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+tests
+phpunit.xml
+.editorconfig
+screenshots
+*.md
+.harness
+k8s
