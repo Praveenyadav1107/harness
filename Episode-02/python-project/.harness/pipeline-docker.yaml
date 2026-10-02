@@ -19,7 +19,7 @@ pipeline:
   ##################################################
   # CHANGE THIS: Your project ID
   ###################################################
-  projectIdentifier: HarnessCICDZerotoHero
+  projectIdentifier: Harness-CI-CD-Zero-to-Hero
   ####################################################
   # CHANGE THIS: Your org name
   ###################################################
@@ -35,7 +35,7 @@ pipeline:
         ###############################################
         # CHANGE THIS: Your repo name
         ###############################################
-        repoName: Harness-CI-CD-Zero-to-Hero
+        repoName: harness
         build: <+input>
   stages:
     - stage:
