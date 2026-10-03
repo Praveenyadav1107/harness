@@ -19,7 +19,7 @@ pipeline:
   ##################################################
   # CHANGE THIS: Your project ID
   ###################################################
-  projectIdentifier: Harness-CI-CD-Zero-to-Hero
+  projectIdentifier: HarnessCICDZerotoHero
   ####################################################
   # CHANGE THIS: Your org name
   ###################################################
