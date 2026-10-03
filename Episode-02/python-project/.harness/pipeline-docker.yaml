@@ -36,7 +36,10 @@ pipeline:
         # CHANGE THIS: Your repo name
         ###############################################
         repoName: harness
-        build: <+input>
+        build: 
+          type: branch
+          spec:
+            branch: master
   stages:
     - stage:
         name: build-python
