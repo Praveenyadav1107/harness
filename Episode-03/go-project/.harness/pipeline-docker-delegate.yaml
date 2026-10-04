@@ -27,9 +27,9 @@ pipeline:
     ci:
       codebase:
         # CHANGE THIS: Your GitHub connector
-        connectorRef: account.Github
+        connectorRef: Harnesspy
         # CHANGE THIS: Your repo name
-        repoName: Harness-CI-CD-Zero-to-Hero
+        repoName: harness
         build: <+input>
   stages:
     - stage:
